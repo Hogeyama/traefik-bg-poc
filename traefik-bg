@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGDIR=$(cd "$(dirname "$0")" && pwd)
+PROGNAME=$(basename "$0")
+COMPOSE_DIR=$PROGDIR/apps
+TRAEFIK_DYNAMIC_CONFIG_DIR=$PROGDIR/config/dynamic
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf $TMPDIR' EXIT
+
+app=""
+tag=""
+undeploy=0
+parseargs() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --app)
+      app=$2
+      shift
+      ;;
+    --deploy)
+      tag=$2
+      shift
+      ;;
+    --undeploy-old)
+      undeploy=1
+      ;;
+    *)
+      die "Unknown option: $1"
+      ;;
+    esac
+    shift
+  done
+
+  if [[ -z $app ]] || [[ $undeploy -eq 0 && -z $tag ]]; then
+    log "Missing required arguments"
+    usage
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<EOF
+Session-aware Blue/Green Deployment with Traefik
+
+USAGE:
+    $PROGNAME --app <app> (--deploy <tag>|--undeploy-old) [OPTIONS]
+
+ARGS:
+    <app>    Application name
+    <tag>    Docker image tag to deploy
+
+OPTIONS:
+    -h, --help       Print help information
+EOF
+}
+
+################################################################################
+
+COMPOSE_YAML=""
+TRAEFIK_DYNAMIC_YAML=
+main() {
+  parseargs "$@"
+
+  COMPOSE_YAML="$COMPOSE_DIR/$app/compose.yml"
+  TRAEFIK_DYNAMIC_YAML="$TRAEFIK_DYNAMIC_CONFIG_DIR/$app.yml"
+
+  if ((undeploy)); then
+    if [[ -f $COMPOSE_YAML ]]; then
+      undeploy
+    else
+      die "$COMPOSE_YAML does not exist"
+    fi
+  else
+    if [[ -f $COMPOSE_YAML ]]; then
+      update
+    else
+      init
+    fi
+  fi
+
+}
+
+init() {
+  log "Generating $COMPOSE_YAML"
+  local service
+  service=$(gen_service_json "$app" "$tag" "current")
+  mkdir -p "$COMPOSE_DIR/$app"
+  # shellcheck disable=SC2016
+  yq -ny --arg app "$app" --arg tag "$tag" --argjson service "$service" '{
+    services: $service,
+    networks: {
+      default: {
+        external: true,
+        name: "traefik"
+      }
+    }
+  }' >"$COMPOSE_YAML"
+
+  log "Starting the service"
+  docker_up_current
+
+  log "Update default traefik route"
+  gen_traefik_router "$app" "$tag" >"$TRAEFIK_DYNAMIC_YAML"
+
+  log "Done"
+}
+
+update() {
+  local current
+  current=$(yq -r '.services|to_entries[]|select(.value.profiles == ["current"])|.key' <"$COMPOSE_YAML")
+
+  log "Updating $COMPOSE_YAML"
+  local yml_tmp
+  yml_tmp="$TMPDIR/compose.$app.yml"
+  local next_service
+  next_service=$(gen_service_json "$app" "$tag" "current")
+  # shellcheck disable=SC2016
+  yq -y --arg current "$current" --argjson next_service "$next_service" '.
+    | .services."\($current)".profiles = ["old"]
+    | .services += $next_service
+  ' "$COMPOSE_YAML" >"$yml_tmp"
+  mv "$yml_tmp" "$COMPOSE_YAML"
+
+  log "Starting the service"
+  docker_up_current
+
+  log "Update default traefik route"
+  gen_traefik_router "$app" "$tag" >"$TRAEFIK_DYNAMIC_CONFIG_DIR/$app.yml"
+
+  log "Done"
+}
+
+undeploy() {
+  mapfile -t old_services < <(
+    yq -r '.services|to_entries[]|select(.value.profiles == ["old"])|.key' <"$COMPOSE_YAML"
+  )
+  if [[ ${#old_services[@]} -eq 0 ]]; then
+    log "No old services to undeploy"
+    return
+  fi
+  log "Old containers: ${old_services[*]}"
+
+  local removable=()
+  for service in "${old_services[@]}"; do
+    if ! is_running "$service"; then
+      log "$service is not running"
+      removable+=("$service")
+    else
+      num=$(num_sessions "$app" "$service")
+      if [[ $num -eq 0 ]]; then
+        log "$service is running but has no sessions. Undeploying"
+        docker_stop "$service"
+        removable+=("$service")
+      else
+        log "$service has $num session(s). Cannot undeploy yet."
+      fi
+    fi
+  done
+
+  log "Removing undeployed services from the compose file"
+  for service in "${removable[@]}"; do
+    # shellcheck disable=SC2016
+    yq -y --arg service "$service" 'del(.services[$service])' "$COMPOSE_YAML" >"$TMPDIR/compose.yml"
+    mv "$TMPDIR/compose.yml" "$COMPOSE_YAML"
+  done
+
+  log "Done"
+}
+
+################################################################################
+# Library
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+log() {
+  local bold normal
+  bold=$(tput setaf 3 bold)
+  normal=$(tput sgr0)
+  printf "${bold}%s${normal}\n" "$*" >&2
+}
+
+gen_service_json() {
+  local app=$1 tag=$2 profile=$3
+  # shellcheck disable=SC2016
+  jq -nc --arg app "$app" --arg tag "$tag" --arg profile "$profile" '
+    {
+      "\($tag)": {
+        image: "\($app):\($tag)",
+        labels: [
+          "traefik.http.services.\($app)-\($tag).loadBalancer.server.port=8080",
+          "traefik.http.services.\($app)-\($tag).loadBalancer.sticky.cookie.name=\($app)-\($tag)",
+          "traefik.http.services.\($app)-\($tag).loadBalancer.sticky.cookie.maxAge=60",
+          "traefik.http.routers.\($app)-\($tag).rule="
+            + "PathPrefix(`/\($app)`)"
+            + "&&HeaderRegexp(`Cookie`,`\($app)-\($tag)=`)",
+            # + "&&HeaderRegexp(`JSESSIONID`,`.`)",
+          "traefik.http.routers.\($app)-\($tag).priority=100"
+        ],
+        profiles: [$profile]
+      }
+    }
+  '
+}
+
+# sticky headerがついていないときのデフォルトルーティング
+gen_traefik_router() {
+  local app=$1 tag=$2
+  # shellcheck disable=SC2016
+  yq -ny --arg app "$app" --arg tag "$tag" '
+    {
+      http: {
+        routers: {
+          "\($app)-default": {
+            rule: "PathPrefix(`/\($app)`)",
+            service: "\($app)-\($tag)@docker",
+            priority: 2,
+          }
+        }
+      }
+    }
+  '
+}
+
+docker_up_current() {
+  (cd "$(dirname "$COMPOSE_YAML")" && docker compose --profile current up -d --remove-orphans)
+}
+
+docker_stop() {
+  local service=$1
+  (cd "$(dirname "$COMPOSE_YAML")" && docker compose stop "$service")
+}
+
+# tomcatを仮定。userpassも仮定
+num_sessions() {
+  local app=$1 service=$2
+  (cd "$COMPOSE_DIR/$app" &&
+    docker compose exec "$service" \
+      curl -fsS http://localhost:8080/manager/text/list -u tomcat:tomcat |
+    grep "^/$app:" | cut -d: -f3)
+}
+
+is_running() {
+  local service=$1 running
+  running=$(docker compose -f "$COMPOSE_YAML" ps --format json |
+    jq -c --arg service "$service" '
+      select(
+        .Service=="\($service)" and
+        .State == ("paused","restarting","removing","running","created")
+      )
+    ' | wc -l)
+  [[ $running -gt 0 ]]
+}
+
+################################################################################
+
+main "$@"

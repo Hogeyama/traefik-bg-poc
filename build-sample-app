@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+TAG=$1
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf $TMPDIR' EXIT
+
+cd "$TMPDIR"
+
+dockerfile=Dockerfile
+userxml=tomcat-users.xml
+
+cat >"$userxml" <<-EOF
+	<?xml version="1.0" encoding="UTF-8"?>
+	<tomcat-users xmlns="http://tomcat.apache.org/xml"
+	              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	              xsi:schemaLocation="http://tomcat.apache.org/xml tomcat-users.xsd"
+	              version="1.0">
+	  <user username="tomcat" password="tomcat" roles="manager-script,manager-gui"/>
+	</tomcat-users>
+	EOF
+
+cat >"$dockerfile" <<-EOF
+	FROM tomcat:9.0-jdk8-corretto
+	RUN mkdir -p /usr/local/tomcat/webapps/app && \
+	    cp -r /usr/local/tomcat/webapps{.dist,}/manager && \
+	    echo '<html><body><h1>Tag: $TAG</h1></body></html>' \
+	      > /usr/local/tomcat/webapps/app/index.html
+	COPY $userxml /usr/local/tomcat/conf/tomcat-users.xml
+	EOF
+
+docker build -t app:"$TAG" -f "$dockerfile" .
